@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import subprocess
+import shutil
+import tempfile
+import re
+from pathlib import Path
+
+# --- Утилиты ---
+
+def require_root():
+    if os.geteuid() != 0:
+        print("Ошибка: Требуются права root. Запустите с sudo.")
+        sys.exit(1)
+
+def run(cmd, check=True, capture=False):
+    return subprocess.run(cmd, check=check, capture_output=capture, text=True)
+
+# --- Определение ОС ---
+
+def detect_distro():
+    """
+    Определяем тип системы: debian или rhel
+    """
+    os_release = Path("/etc/os-release")
+    if not os_release.exists():
+        print("Ошибка: Не найден /etc/os-release")
+        sys.exit(1)
+    
+    with open(os_release) as f:
+        data = f.read().lower()
+    
+    if 'ubuntu' in data or 'debian' in 
+        return 'debian'
+    elif 'rhel' in data or 'centos' in data or 'rocky' in data or 'alma' in data or 'fedora' in 
+        return 'rhel'
+    else:
+        print("Не удалось определить дистрибутив.")
+        sys.exit(1)
+
+DISTRO = detect_distro()
+
+# --- Управление пакетами ---
+
+def package_installed(pkg):
+    if DISTRO == 'debian':
+        result = run(['dpkg', '-s', pkg], check=False, capture=True)
+        return result.returncode == 0
+    else:
+        result = run(['rpm', '-q', pkg], check=False, capture=True)
+        return result.returncode == 0
+
+def install_packages(packages):
+    print(f"Устанавливаю пакеты: {', '.join(packages)}")
+    if DISTRO == 'debian':
+        run(['apt-get', 'update'], check=True)
+        run(['apt-get', 'install', '-y'] + packages, check=True)
+    else:
+        if shutil.which('dnf'):
+            run(['dnf', 'install', '-y'] + packages, check=True)
+        else:
+            run(['yum', 'install', '-y'] + packages, check=True)
+
+# --- SELinux ---
+
+def selinux_status():
+    try:
+        result = run(['getenforce'], capture=True)
+        mode = result.stdout.strip()
+        return mode if mode in ['Enforcing', 'Permissive'] else 'Disabled'
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return 'Not installed'
+
+def disable_selinux():
+    print("Отключаю SELinux...")
+    run(['setenforce', '0'], check=False)
+    config_path = "/etc/selinux/config"
+    if Path(config_path).exists():
+        with open(config_path) as f:
+            lines = f.readlines()
+        with open(config_path, 'w') as f:
+            for line in lines:
+                if line.startswith('SELINUX='):
+                    f.write('SELINUX=disabled\n')
+                else:
+                    f.write(line)
+
+def enable_selinux():
+    print("Включаю SELinux...")
+    config_path = "/etc/selinux/config"
+    if not Path(config_path).exists():
+        print(f"Ошибка: {config_path} не существует.")
+        sys.exit(1)
+    with open(config_path) as f:
+        lines = f.readlines()
+    with open(config_path, 'w') as f:
+        has_selinux = False
+        has_selinuxtype = False
+        for line in lines:
+            if line.startswith('SELINUX='):
+                f.write('SELINUX=enforcing\n')
+                has_selinux = True
+            elif line.startswith('SELINUXTYPE='):
+                f.write('SELINUXTYPE=targeted\n')
+                has_selinuxtype = True
+            else:
+                f.write(line)
+        if not has_selinux:
+            f.write('SELINUX=enforcing\n')
+        if not has_selinuxtype:
+            f.write('SELINUXTYPE=targeted\n')
+
+# --- AppArmor ---
+
+def apparmor_status():
+    try:
+        result = run(['systemctl', 'is-active', 'apparmor'], capture=True)
+        return result.stdout.strip() == 'active'
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+
+def disable_apparmor():
+    print("Отключаю AppArmor...")
+    run(['systemctl', 'stop', 'apparmor'], check=False)
+    run(['systemctl', 'disable', 'apparmor'], check=False)
+
+def enable_apparmor():
+    print("Включаю AppArmor...")
+    run(['systemctl', 'enable', 'apparmor'], check=True)
+    run(['systemctl', 'start', 'apparmor'], check=True)
+
+# --- Кросс-перенос политик ---
+
+# Извлечение нарушений SELinux -> генерация AppArmor-профилей
+def convert_selinux_to_apparmor():
+    print("Анализ логов SELinux для генерации AppArmor профилей...")
+    log_paths = ["/var/log/audit/audit.log", "/var/log/syslog", "/var/log/messages"]
+    audit_log = next((p for p in log_paths if Path(p).exists()), None)
+
+    if not audit_log:
+        print("Логи SELinux не найдены.")
+        return
+
+    try:
+        result = run(['ausearch', '-m', 'AVC', '-ts', 'recent'], capture=True, check=False)
+        if result.returncode != 0 or not result.stdout.strip():
+            print("Нет новых нарушений SELinux.")
+            return
+
+        # Извлекаем: comm=..., path=..., dev=..., ino=..., scontext=..., tcontext=..., tclass=..., permissive=0
+        violations = []
+        for line in result.stdout.splitlines():
+            # Пример: type=AVC msg=audit(123.456:789): avc: denied { read } for pid=123 comm="bash" path="/etc/shadow" dev="sda1" scontext=unconfined_u:unconfined_r:unconfined_t:s0 tcontext=system_u:object_r:shadow_t:s0 tclass=file permissive=0
+            match = re.search(r'comm="([^"]+)"\s+.*\spath="([^"]+)"\s+.*\s{([^}]+)}', line)
+            if match:
+                comm, path, perm = match.group(1), match.group(2), match.group(3)
+                # Упрощаем: только read/write -> r/w
+                mode = ""
+                if "read" in perm: mode += "r"
+                if "write" in perm: mode += "w"
+                if "execute" in perm: mode += "x"
+                if mode:
+                    violations.append((comm, path, mode))
+
+        if not violations:
+            print("Не удалось извлечь действия из логов.")
+            return
+
+        # Группируем по процессу
+        from collections import defaultdict
+        profiles = defaultdict(set)
+        for comm, path, mode in violations:
+            profiles[comm].add((path, mode))
+
+        # Генерация профиля
+        for comm, rules in profiles.items():
+            profile_name = f"/etc/apparmor.d/usr.bin.{comm}"
+            with open(profile_name, 'w') as f:
+                f.write(f"# Профиль, сгенерированный из SELinux для {comm}\n")
+                f.write(f"/usr/bin/{comm} {\n")
+                for path, mode in rules:
+                    f.write(f'  "{path}" {mode},\n')
+                f.write("}\n")
+            print(f"Создан профиль: {profile_name}")
+
+        # Перезагружаем AppArmor
+        run(['systemctl', 'reload', 'apparmor'], check=False)
+        print("Профили AppArmor созданы. Проверьте /etc/apparmor.d/")
+
+    except Exception as e:
+        print(f"Ошибка при конвертации SELinux → AppArmor: {e}")
+
+# Извлечение нарушений AppArmor → генерация SELinux модулей
+def convert_apparmor_to_selinux():
+    print("Анализ логов AppArmor для генерации SELinux политик...")
+    log_paths = ["/var/log/syslog", "/var/log/messages", "/var/log/kern.log"]
+    aa_log = None
+    for log in log_paths:
+        if Path(log).exists():
+            with open(log) as f:
+                if any("apparmor" in line.lower() for line in f.readlines()):
+                    aa_log = log
+                    break
+
+    if not aa_log:
+        print("Логи AppArmor не найдены.")
+        return
+
+    try:
+        # Ищем строки вида: audit: type=1400 audit(123.456:789): apparmor="DENIED" operation="open" profile="/usr/bin/vim" name="/etc/shadow" pid=123 comm="vim"
+        denied_lines = []
+        with open(aa_log) as f:
+            for line in f:
+                if 'apparmor="DENIED"' in line and 'name="' in line:
+                    denied_lines.append(line)
+
+        if not denied_lines:
+            print("Нет зафиксированных нарушений AppArmor.")
+            return
+
+        # Временный файл для audit2allow
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.log') as tf:
+            for line in denied_lines:
+                tf.write(line + "\n")
+            tf.flush()
+
+            # audit2allow не работает напрямую с AppArmor, но можно попробовать извлечь пути
+            print("Создаём предварительный модуль SELinux...")
+            module_name = "apparmor_imported"
+            te_file = f"/tmp/{module_name}.te"
+            with open(te_file, 'w') as f:
+                f.write(f"module {module_name} 1.0;\n\n")
+                f.write("require {\n")
+                f.write("    type unconfined_t;\n")
+                f.write("    class file { read write execute };\n")
+                f.write("}\n\n")
+                f.write("allow unconfined_t self:file { read write execute };\n")
+                # Упрощённо: разрешаем доступ к файлам, к которым был запрещённый доступ
+                for line in denied_lines:
+                    match = re.search(r'name="([^"]+)"\s+.*\sprofile="[^"]*"\s+.*\scomm="([^"]*)"', line)
+                    if match:
+                        path, comm = match.group(1), match.group(2)
+                        f.write(f"# Из AppArmor: {comm} → {path}\n")
+                        f.write(f"allow unconfined_t self:file read;\n")  # упрощение
+
+            print(f"Модуль SELinux сохранён в {te_file}")
+            print("Рекомендуется использовать: checkmodule -M -m -o /tmp/mod.mod /tmp/mod.te && semodule_package -o /tmp/mod.pp -m /tmp/mod.mod && semodule -i /tmp/mod.pp")
+
+    except Exception as e:
+        print(f"Ошибка при конвертации AppArmor → SELinux: {e}")
+
+# --- Основная логика ---
+
+def main():
+    require_root()
+
+    selinux = selinux_status()
+    aa_active = apparmor_status()
+
+    print(f"Определён дистрибутив: {DISTRO.upper()}")
+    print("Текущее состояние:")
+    print(f"  SELinux: {selinux}")
+    print(f"  AppArmor: {'active' if aa_active else 'inactive'}")
+
+    if selinux in ['Enforcing', 'Permissive'] and not aa_active:
+        print("\nПереключиться с SELinux на AppArmor?")
+        if input("Подтвердите (y/N): ").strip().lower() not in ['y', 'yes']:
+            print("Отмена.")
+            return
+
+        disable_selinux()
+        if not package_installed('apparmor'):
+            install_packages(['apparmor', 'apparmor-utils'])
+        enable_apparmor()
+        convert_selinux_to_apparmor()
+        print("Переключение на AppArmor завершено.")
+
+    elif aa_active and selinux == 'Disabled':
+        print("\nПереключиться с AppArmor на SELinux?")
+        if input("Подтвердите (y/N): ").strip().lower() not in ['y', 'yes']:
+            print("Отмена.")
+            return
+
+        disable_apparmor()
+        pkgs = ['selinux-policy-targeted', 'policycoreutils', 'audit'] if DISTRO == 'rhel' else ['selinux-basics', 'selinux-policy-default', 'auditd']
+        missing = [p for p in pkgs if not package_installed(p)]
+        if missing:
+            install_packages(missing)
+
+        enable_selinux()
+        run(['setenforce', '1'], check=True)
+        convert_apparmor_to_selinux()
+        Path("/.autorelabel").touch()
+        print("Переключение на SELinux завершено. Будет выполнена перемаркировка при загрузке.")
+
+    else:
+        print("Обе системы активны или обе отключены — требуется ручная корректировка.")
+        print("Убедитесь, что активна только одна система безопасности.")
+        sys.exit(1)
+
+    print("\nДля применения изменений требуется перезагрузка.")
+    if input("Выполнить перезагрузку сейчас? (y/N): ").strip().lower() in ['y', 'yes']:
+        run(['reboot'])
+
+if __name__ == "__main__":
+    main()
