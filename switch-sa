@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 
+"""
+SELinux to AppArmor Switch Tool
+
+A Python-based utility designed to switch between SELinux and AppArmor 
+on Linux systems. It supports major enterprise Linux distributions, 
+including Debian/Ubuntu and RHEL/CentOS/Fedora-based systems.
+"""
+
 import os
 import sys
 import subprocess
@@ -7,22 +15,38 @@ import shutil
 import tempfile
 import re
 from pathlib import Path
+from typing import Optional, Tuple, List
 
 # --- Утилиты ---
 
-def require_root():
+def require_root() -> None:
+    """Проверяет, запущен ли скрипт с правами root."""
     if os.geteuid() != 0:
         print("Ошибка: Требуются права root. Запустите с sudo.")
         sys.exit(1)
 
-def run(cmd, check=True, capture=False):
+def run(cmd: List[str], check: bool = True, capture: bool = False) -> subprocess.CompletedProcess:
+    """
+    Выполняет команду и возвращает результат.
+    
+    Args:
+        cmd: Команда для выполнения
+        check: Проверять ли код возврата
+        capture: Захватывать ли вывод
+    
+    Returns:
+        Результат выполнения команды
+    """
     return subprocess.run(cmd, check=check, capture_output=capture, text=True)
 
 # --- Определение ОС ---
 
-def detect_distro():
+def detect_distro() -> str:
     """
-    Определяем тип системы: debian или rhel
+    Определяет тип системы: debian или rhel
+    
+    Returns:
+        Строковый идентификатор дистрибутива ('debian' или 'rhel')
     """
     os_release = Path("/etc/os-release")
     if not os_release.exists():
@@ -32,9 +56,9 @@ def detect_distro():
     with open(os_release) as f:
         data = f.read().lower()
     
-    if 'ubuntu' in data or 'debian' in 
+    if 'ubuntu' in data or 'debian' in data:
         return 'debian'
-    elif 'rhel' in data or 'centos' in data or 'rocky' in data or 'alma' in data or 'fedora' in 
+    elif 'rhel' in data or 'centos' in data or 'rocky' in data or 'alma' in data or 'fedora' in data:
         return 'rhel'
     else:
         print("Не удалось определить дистрибутив.")
@@ -44,7 +68,16 @@ DISTRO = detect_distro()
 
 # --- Управление пакетами ---
 
-def package_installed(pkg):
+def package_installed(pkg: str) -> bool:
+    """
+    Проверяет, установлен ли пакет.
+    
+    Args:
+        pkg: Название пакета для проверки
+        
+    Returns:
+        True если пакет установлен, иначе False
+    """
     if DISTRO == 'debian':
         result = run(['dpkg', '-s', pkg], check=False, capture=True)
         return result.returncode == 0
@@ -52,7 +85,13 @@ def package_installed(pkg):
         result = run(['rpm', '-q', pkg], check=False, capture=True)
         return result.returncode == 0
 
-def install_packages(packages):
+def install_packages(packages: List[str]) -> None:
+    """
+    Устанавливает указанные пакеты.
+    
+    Args:
+        packages: Список пакетов для установки
+    """
     print(f"Устанавливаю пакеты: {', '.join(packages)}")
     if DISTRO == 'debian':
         run(['apt-get', 'update'], check=True)
@@ -65,7 +104,13 @@ def install_packages(packages):
 
 # --- SELinux ---
 
-def selinux_status():
+def selinux_status() -> str:
+    """
+    Получает статус SELinux.
+    
+    Returns:
+        Статус SELinux ('Enforcing', 'Permissive', 'Disabled', 'Not installed')
+    """
     try:
         result = run(['getenforce'], capture=True)
         mode = result.stdout.strip()
@@ -73,7 +118,8 @@ def selinux_status():
     except (FileNotFoundError, subprocess.CalledProcessError):
         return 'Not installed'
 
-def disable_selinux():
+def disable_selinux() -> None:
+    """Отключает SELinux."""
     print("Отключаю SELinux...")
     run(['setenforce', '0'], check=False)
     config_path = "/etc/selinux/config"
@@ -87,7 +133,8 @@ def disable_selinux():
                 else:
                     f.write(line)
 
-def enable_selinux():
+def enable_selinux() -> None:
+    """Включает SELinux."""
     print("Включаю SELinux...")
     config_path = "/etc/selinux/config"
     if not Path(config_path).exists():
@@ -114,19 +161,27 @@ def enable_selinux():
 
 # --- AppArmor ---
 
-def apparmor_status():
+def apparmor_status() -> bool:
+    """
+    Получает статус AppArmor.
+    
+    Returns:
+        True если AppArmor активен, иначе False
+    """
     try:
         result = run(['systemctl', 'is-active', 'apparmor'], capture=True)
         return result.stdout.strip() == 'active'
     except (FileNotFoundError, subprocess.CalledProcessError):
         return False
 
-def disable_apparmor():
+def disable_apparmor() -> None:
+    """Отключает AppArmor."""
     print("Отключаю AppArmor...")
     run(['systemctl', 'stop', 'apparmor'], check=False)
     run(['systemctl', 'disable', 'apparmor'], check=False)
 
-def enable_apparmor():
+def enable_apparmor() -> None:
+    """Включает AppArmor."""
     print("Включаю AppArmor...")
     run(['systemctl', 'enable', 'apparmor'], check=True)
     run(['systemctl', 'start', 'apparmor'], check=True)
